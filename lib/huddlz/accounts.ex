@@ -25,6 +25,7 @@ defmodule Huddlz.Accounts do
       define :update_role, action: :update_role, args: [:role]
       define :suspend_user, action: :suspend, args: [:reason]
       define :restore_user, action: :restore
+      define :delete_account, action: :delete_account, args: [:current_password]
       define :get_by_email, action: :get_by_email, args: [:email]
       define :update_display_name, action: :update_display_name, args: [:display_name]
 
@@ -59,11 +60,20 @@ defmodule Huddlz.Accounts do
 
     resource Huddlz.Accounts.AccountReport do
       define :report_account, action: :report
+      define :report_huddl_organizer, action: :report_organizer, args: [:huddl_id]
+      define :report_group_owner, action: :report_group, args: [:group_id]
       define :get_account_report, action: :read, get_by: [:id]
       define :count_account_reports, action: :count_queue, args: [:handled]
       define :list_account_reports, action: :queue, args: [{:optional, :handled}]
       define :mark_report_handled, action: :mark_handled
       define :reopen_report, action: :reopen
+    end
+
+    resource Huddlz.Accounts.UserBlock do
+      define :block_huddl_organizer, action: :block_organizer, args: [:huddl_id]
+      define :block_group_owner, action: :block_group_owner, args: [:group_id]
+      define :list_blocks, action: :mine
+      define :unblock, action: :unblock
     end
   end
 end

@@ -164,7 +164,8 @@ Feature: Group archival
     When I visit the group page for "Stale Club"
     Then I should not see "This should not save"
 
-  Scenario: An archived draft cannot be published through the API
+  @archived_draft
+  Scenario: An archived draft is read-only on the huddl page and through the API
     Given the following users exist:
       | email                            | role | display_name |
       | owner+group-archival@example.com | user | Owner        |
@@ -178,6 +179,10 @@ Feature: Group archival
     Then the archived huddl change is rejected
     When I open the archived huddl "Next season"
     Then the "Publish huddl" button should not be visible
+    And I should not see "Edit huddl"
+    When I follow a saved edit link for "Next season"
+    Then I should see "You don't have permission to edit this huddl"
+    And I should see "This group is archived"
 
   Scenario: An outstanding invitation cannot reopen membership in an archived group
     Given the following users exist:
@@ -320,6 +325,25 @@ Feature: Group archival
       | other@example.com                 | GraphQL  | hidden     |
       | member+group-archival@example.com | JSON:API | visible    |
       | other@example.com                 | JSON:API | hidden     |
+
+  @archived_overview
+  Scenario: An organizer retains the overview of a private group after archival
+    Given the following users exist:
+      | email                          | role  | display_name |
+      | owner+overview@example.com     | user  | Owner        |
+      | organizer+overview@example.com | user  | Organizer    |
+      | admin+overview@example.com     | admin | Admin        |
+    And a private group "Overview Archive" exists with owner "owner+overview@example.com"
+    And "organizer+overview@example.com" is an organizer of "Overview Archive"
+    And I am signed in as "owner+overview@example.com"
+    When I visit the edit page for "Overview Archive"
+    And I click "Archive group"
+    And I click "Yes, archive group"
+    Then I should see "This group is archived"
+    When "organizer+overview@example.com" reads the overview of "Overview Archive" for "30d" through GraphQL
+    Then the API overview shows 2 members and 2 joined this month
+    When "admin+overview@example.com" reads the overview of "Overview Archive" for "30d" through GraphQL
+    Then the API refuses the overview
 
   @archived_attendance
   Scenario Outline: Attendance history keeps its access rules after archival

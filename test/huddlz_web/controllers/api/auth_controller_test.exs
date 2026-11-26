@@ -173,6 +173,60 @@ defmodule HuddlzWeb.Api.AuthControllerTest do
       assert user["id"] == target.id
       assert user["email"] == "me@example.com"
       assert user["display_name"] == "Me"
+      assert Map.fetch!(user, "avatar_url") == nil
+    end
+
+    test "returns the user's current avatar_url on /me and /sign_in, and null after removal", %{
+      conn: conn
+    } do
+      target =
+        generate(
+          user_with_password(
+            email: "avatar-me@example.com",
+            display_name: "Avatar Me",
+            password: "correct horse battery staple"
+          )
+        )
+
+      picture =
+        Huddlz.Accounts.ProfilePicture
+        |> Ash.Changeset.for_create(
+          :create,
+          %{
+            user_id: target.id,
+            filename: "avatar.jpg",
+            content_type: "image/jpeg",
+            size_bytes: 100,
+            storage_path: "/uploads/profile_pictures/#{target.id}/avatar.jpg",
+            thumbnail_path: "/uploads/profile_pictures/#{target.id}/avatar_thumb.jpg"
+          },
+          actor: target
+        )
+        |> Ash.create!()
+
+      expected = HuddlzWeb.Endpoint.url() <> picture.thumbnail_path
+
+      me_body = conn |> authenticated_conn(target) |> get("/api/auth/me") |> json_response(200)
+      assert me_body["user"]["avatar_url"] == expected
+
+      sign_in_body =
+        conn
+        |> post("/api/auth/sign_in", %{
+          "email" => "avatar-me@example.com",
+          "password" => "correct horse battery staple"
+        })
+        |> json_response(200)
+
+      assert sign_in_body["user"]["avatar_url"] == expected
+
+      picture
+      |> Ash.Changeset.for_update(:soft_delete, %{}, actor: target)
+      |> Ash.update!()
+
+      after_delete =
+        conn |> authenticated_conn(target) |> get("/api/auth/me") |> json_response(200)
+
+      assert Map.fetch!(after_delete["user"], "avatar_url") == nil
     end
 
     test "returns 401 when no bearer is provided", %{conn: conn} do
@@ -227,6 +281,29 @@ defmodule HuddlzWeb.Api.AuthControllerTest do
   end
 
   describe "POST /api/auth/api_keys" do
+    test "accepts relative days from one through 365 and defaults to 30", %{conn: conn} do
+      conn = authenticated_conn(conn, generate(user()))
+
+      for {params, days} <- [
+            {%{}, 30},
+            {%{"expires_in_days" => 1}, 1},
+            {%{"expires_in_days" => "365"}, 365}
+          ] do
+        earliest = DateTime.add(DateTime.utc_now(), days, :day)
+
+        response =
+          conn
+          |> post("/api/auth/api_keys", Map.put(params, "name", "Laptop"))
+          |> json_response(201)
+
+        latest = DateTime.add(DateTime.utc_now(), days, :day)
+
+        assert {:ok, expiry, 0} = DateTime.from_iso8601(response["expires_at"])
+        refute DateTime.before?(expiry, earliest)
+        refute DateTime.after?(expiry, latest)
+      end
+    end
+
     test "creates an API key for the actor and returns the plaintext once", %{conn: conn} do
       target = generate(user())
 
@@ -277,37 +354,23 @@ defmodule HuddlzWeb.Api.AuthControllerTest do
       assert json_response(conn, 401) == %{"error" => "Authentication required"}
     end
 
-    test "rejects negative expires_in_days with 422", %{conn: conn} do
-      target = generate(user())
+    test "returns a field error for invalid relative days", %{conn: conn} do
+      conn = authenticated_conn(conn, generate(user()))
 
-      conn =
-        conn
-        |> authenticated_conn(target)
-        |> post("/api/auth/api_keys", %{"name" => "Laptop", "expires_in_days" => -1})
+      for {value, message} <- [
+            {0, "must be between 1 and 365 days"},
+            {366, "must be between 1 and 365 days"},
+            {"3.5", "must be an integer"},
+            {"banana", "must be an integer"},
+            {nil, "must be an integer"}
+          ] do
+        response =
+          post(conn, "/api/auth/api_keys", %{"name" => "Laptop", "expires_in_days" => value})
 
-      assert %{"errors" => [%{"field" => "expires_in_days"}]} = json_response(conn, 422)
-    end
-
-    test "rejects oversized expires_in_days with 422", %{conn: conn} do
-      target = generate(user())
-
-      conn =
-        conn
-        |> authenticated_conn(target)
-        |> post("/api/auth/api_keys", %{"name" => "Laptop", "expires_in_days" => 365_000})
-
-      assert %{"errors" => [%{"field" => "expires_in_days"}]} = json_response(conn, 422)
-    end
-
-    test "rejects malformed expires_in_days with 422", %{conn: conn} do
-      target = generate(user())
-
-      conn =
-        conn
-        |> authenticated_conn(target)
-        |> post("/api/auth/api_keys", %{"name" => "Laptop", "expires_in_days" => "banana"})
-
-      assert %{"errors" => [%{"field" => "expires_in_days"}]} = json_response(conn, 422)
+        assert json_response(response, 422) == %{
+                 "errors" => [%{"field" => "expires_in_days", "message" => message}]
+               }
+      end
     end
   end
 

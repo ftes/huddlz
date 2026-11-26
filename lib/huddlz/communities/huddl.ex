@@ -3,6 +3,9 @@ defmodule Huddlz.Communities.Huddl do
   A huddl is a gathering within the huddlz platform.
   """
 
+  alias Huddlz.Communities
+  alias Huddlz.Communities.Group
+
   require Ash.Query
 
   use Ash.Resource,
@@ -13,6 +16,17 @@ defmodule Huddlz.Communities.Huddl do
     notifiers: [Ash.Notifier.PubSub],
     extensions: [AshOban, AshJsonApi.Resource, AshGraphql.Resource, AshPaperTrail.Resource],
     primary_read_warning?: false
+
+  @doc "Whether the viewer can open the edit form for a huddl with its group loaded."
+  def editable_by?(huddl, actor) do
+    Group.active?(huddl.group) and Communities.can_update_huddl?(actor, huddl)
+  end
+
+  @doc "Whether cancellation would transition this huddl to cancelled."
+  def cancellable?(%{lifecycle_state: :published, ends_at: ends_at}),
+    do: DateTime.after?(ends_at, DateTime.utc_now())
+
+  def cancellable?(_huddl), do: false
 
   graphql do
     type :huddl
@@ -59,6 +73,7 @@ defmodule Huddlz.Communities.Huddl do
       :thumbnail_url,
       :max_attendees,
       :attendance_state,
+      :organized_by_me,
       :lifecycle_state,
       :published_at,
       :cancelled_at,
@@ -220,6 +235,11 @@ defmodule Huddlz.Communities.Huddl do
     destroy :destroy do
       change Huddlz.Communities.Changes.RequireActiveGroup
       primary? true
+      require_atomic? false
+    end
+
+    destroy :destroy_for_account_deletion do
+      description "System-only: remove unpublished drafts when a group owner deletes their account, including in already-archived groups."
       require_atomic? false
     end
 
@@ -399,6 +419,9 @@ defmodule Huddlz.Communities.Huddl do
         :huddl_template_id
       ]
 
+      argument :pending_image_id, :uuid, public?: false
+      change Huddlz.Communities.Changes.ReplaceCover
+
       # Virtual arguments for form inputs
       argument :date, :date, allow_nil?: true
       argument :start_time, :time, allow_nil?: true
@@ -492,6 +515,7 @@ defmodule Huddlz.Communities.Huddl do
     read :upcoming do
       filter expr(lifecycle_state == :published and ends_at > now())
       prepare Huddlz.Communities.Huddl.Preparations.FilterByVisibility
+      prepare Huddlz.Communities.Huddl.Preparations.HideBlockedOrganizers
       prepare build(sort: [starts_at: :asc])
     end
 
@@ -563,6 +587,7 @@ defmodule Huddlz.Communities.Huddl do
 
       prepare Huddlz.Communities.Huddl.Preparations.FilterByVisibility
       prepare Huddlz.Communities.Huddl.Preparations.ApplySearchFilters
+      prepare Huddlz.Communities.Huddl.Preparations.HideBlockedOrganizers
     end
 
     read :by_group do
@@ -582,6 +607,7 @@ defmodule Huddlz.Communities.Huddl do
                  default_limit: 10
 
       prepare Huddlz.Communities.Huddl.Preparations.FilterByVisibility
+      prepare Huddlz.Communities.Huddl.Preparations.HideBlockedOrganizers
       prepare build(sort: [starts_at: :asc])
     end
 
@@ -919,6 +945,10 @@ defmodule Huddlz.Communities.Huddl do
                    )
     end
 
+    policy action(:destroy_for_account_deletion) do
+      forbid_if always()
+    end
+
     policy action(:destroy) do
       description "Only group owners and organizers can delete an unpublished draft"
       forbid_unless expr(lifecycle_state == :draft)
@@ -1207,6 +1237,12 @@ defmodule Huddlz.Communities.Huddl do
     has_many :huddl_cover_images, Huddlz.Communities.HuddlCoverImage do
       destination_attribute :huddl_id
     end
+
+    has_many :organizer_blocks, Huddlz.Accounts.UserBlock do
+      description "Blocks people have placed on this huddl's organizer"
+      source_attribute :creator_id
+      destination_attribute :blocked_user_id
+    end
   end
 
   calculations do
@@ -1226,6 +1262,12 @@ defmodule Huddlz.Communities.Huddl do
                         "none"
                     end
                   )
+    end
+
+    calculate :organized_by_me, :boolean do
+      public? true
+      description "Whether the current caller organized this huddl"
+      calculation expr(not is_nil(^actor(:id)) and creator_id == ^actor(:id))
     end
 
     calculate :status, :atom do
@@ -1270,10 +1312,12 @@ defmodule Huddlz.Communities.Huddl do
     end
 
     calculate :is_publicly_visible, :boolean do
-      description "Whether the huddl is visible to everyone (public huddl in public group)"
+      description "Whether anyone can open this huddl's detail page"
 
       calculation expr(
-                    is_private == false and group.is_public == true and is_nil(group.archived_at)
+                    lifecycle_state in [:published, :completed, :cancelled] and
+                      is_private == false and group.is_public == true and
+                      is_nil(group.archived_at)
                   )
     end
 

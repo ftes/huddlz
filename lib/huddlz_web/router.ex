@@ -133,6 +133,7 @@ defmodule HuddlzWeb.Router do
     post "/sign_in", AuthController, :sign_in
     get "/me", AuthController, :me
     delete "/sign_out", AuthController, :sign_out
+    delete "/account", AuthController, :delete_account
     post "/password_reset", AuthController, :password_reset
     post "/api_keys", AuthController, :create_api_key
     get "/api_keys", AuthController, :list_api_keys
@@ -195,7 +196,7 @@ defmodule HuddlzWeb.Router do
       live "/organize/:group_slug", OrganizeLive, :overview
       live "/organize/:group_slug/huddlz", OrganizeLive, :huddlz
       live "/organize/:group_slug/members", OrganizeLive, :members
-      live "/organize/:group_slug/social", OrganizeLive, :social
+      live "/organize/:group_slug/social", OrganizeLive.Social, :social
       live "/organize/:group_slug/settings", OrganizeLive, :settings
 
       # Group routes

@@ -1,8 +1,10 @@
 defmodule HuddlzWeb.Api.AuthController do
   use HuddlzWeb, :controller
 
+  alias AshAuthentication.Errors.AuthenticationFailed
   alias AshAuthentication.TokenResource
   alias AshRateLimiter.LimitExceeded
+  alias Huddlz.Accounts
   alias Huddlz.Accounts.{ApiKey, Token, User}
 
   def register(conn, params) do
@@ -80,6 +82,62 @@ defmodule HuddlzWeb.Api.AuthController do
     end
   end
 
+  def delete_account(conn, params) do
+    case conn.assigns[:current_user] do
+      %User{} = user -> destroy_account(conn, user, Map.get(params, "password"))
+      _ -> auth_required(conn)
+    end
+  end
+
+  defp destroy_account(conn, _user, password) when not is_binary(password) or password == "" do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      errors: [%{field: "password", message: "Enter your password to delete your account."}]
+    })
+  end
+
+  defp destroy_account(conn, user, password) do
+    case Accounts.delete_account(user, password, actor: user) do
+      {:ok, _user} ->
+        send_resp(conn, :no_content, "")
+
+      {:error, error} ->
+        handle_delete_account_error(conn, error)
+    end
+  end
+
+  defp handle_delete_account_error(conn, error) do
+    case rate_limit_error(error) do
+      %AshRateLimiter.LimitExceeded{} = limit_exceeded ->
+        too_many_requests(conn, limit_exceeded)
+
+      nil ->
+        respond_delete_account_error(conn, error)
+    end
+  end
+
+  defp respond_delete_account_error(conn, %Ash.Error.Forbidden{} = error) do
+    if authentication_failed?(error) do
+      conn
+      |> put_status(:unprocessable_entity)
+      |> json(%{errors: [%{field: "password", message: "That password isn't right."}]})
+    else
+      conn
+      |> put_status(:forbidden)
+      |> json(%{error: "You can't delete this account"})
+    end
+  end
+
+  defp respond_delete_account_error(conn, error) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{errors: format_errors(error)})
+  end
+
+  defp authentication_failed?(%{errors: errors}),
+    do: Enum.any?(errors, &match?(%AuthenticationFailed{}, &1))
+
   def password_reset(conn, params) do
     result =
       case Map.get(params, "email") do
@@ -106,15 +164,12 @@ defmodule HuddlzWeb.Api.AuthController do
     end
   end
 
-  @api_key_min_days 1
-  @api_key_max_days 365
   @api_key_default_days 30
 
   def create_api_key(conn, params) do
     with %User{} = user <- conn.assigns[:current_user] || :unauthorized,
-         {:ok, days} <- parse_expires_in_days(params) do
-      expires_at = DateTime.utc_now() |> DateTime.add(days * 24 * 3600, :second)
-
+         {:ok, expires_at} <-
+           ApiKey.Expiry.from_days(Map.get(params, "expires_in_days", @api_key_default_days)) do
       ApiKey
       |> Ash.Changeset.for_create(:create, %{name: params["name"], expires_at: expires_at},
         actor: user
@@ -230,32 +285,27 @@ defmodule HuddlzWeb.Api.AuthController do
     |> json(%{error: "Not found"})
   end
 
-  defp parse_expires_in_days(%{"expires_in_days" => value}) when is_integer(value),
-    do: validate_days(value)
-
-  defp parse_expires_in_days(%{"expires_in_days" => value}) when is_binary(value) do
-    case Integer.parse(value) do
-      {n, ""} -> validate_days(n)
-      _ -> {:error, "must be an integer"}
-    end
-  end
-
-  defp parse_expires_in_days(%{"expires_in_days" => _}),
-    do: {:error, "must be an integer"}
-
-  defp parse_expires_in_days(_), do: {:ok, @api_key_default_days}
-
-  defp validate_days(n) when n in @api_key_min_days..@api_key_max_days, do: {:ok, n}
-
-  defp validate_days(_),
-    do: {:error, "must be between #{@api_key_min_days} and #{@api_key_max_days} days"}
-
   defp serialize_self(user) do
+    user = Ash.load!(user, [:current_profile_picture_url], actor: user)
+
     %{
       id: user.id,
       email: to_string(user.email),
-      display_name: user.display_name
+      display_name: user.display_name,
+      avatar_url: avatar_url(user)
     }
+  end
+
+  defp avatar_url(user) do
+    case HuddlzWeb.Avatar.picture_url(user) do
+      nil ->
+        nil
+
+      url ->
+        HuddlzWeb.Endpoint.url()
+        |> URI.merge(url)
+        |> URI.to_string()
+    end
   end
 
   defp format_errors(%Ash.Error.Invalid{errors: errors}) do

@@ -7,15 +7,15 @@ defmodule HuddlzWeb.HuddlLive.New do
   import HuddlzWeb.Components.HuddlForm
   import HuddlzWeb.Components.UploadComponents
   import HuddlzWeb.HuddlLive.FormHelpers
-  import HuddlzWeb.Live.Helpers.UploadHelpers
 
   alias Huddlz.Communities
   alias Huddlz.Communities.Huddl
+  alias Huddlz.Communities.Huddl.CopyDefaults
   alias Huddlz.Communities.Huddl.CopySuggestion
   alias Huddlz.Storage.HuddlCoverImages
   alias HuddlzWeb.FormFocus
+  alias HuddlzWeb.HuddlLive.CoverUpload
   alias HuddlzWeb.Layouts
-  alias HuddlzWeb.Live.Helpers.ImageUploadPipeline
 
   on_mount {HuddlzWeb.LiveUserAuth, :live_user_required}
   on_mount {HuddlzWeb.LiveUserAuth, :app}
@@ -50,10 +50,7 @@ defmodule HuddlzWeb.HuddlLive.New do
     |> assign_create_form(group, user)
     |> assign(:group_locations, load_group_locations(group.id, user))
     |> assign(:selected_location, nil)
-    |> assign(:image_error, nil)
-    |> assign(:pending_image_id, nil)
-    |> assign(:pending_preview_url, nil)
-    |> assign(:upload_processing, false)
+    |> CoverUpload.init()
     |> assign(:copy_source, nil)
     |> assign(:copy_cover?, false)
     |> maybe_allow_image_upload()
@@ -63,7 +60,7 @@ defmodule HuddlzWeb.HuddlLive.New do
     do: socket
 
   defp maybe_allow_image_upload(socket) do
-    allow_image_upload(socket, :huddl_cover_image, &handle_upload_progress/3)
+    CoverUpload.allow(socket, socket.assigns.group.id)
   end
 
   defp assign_create_form(socket, group, user) do
@@ -88,7 +85,6 @@ defmodule HuddlzWeb.HuddlLive.New do
     |> assign(:form, to_form(form))
     |> assign(:show_virtual_link, false)
     |> assign(:show_physical_location, true)
-    |> assign(:calculated_end_time, calculate_end_time(tomorrow, default_time, 60))
   end
 
   # `?copy=<huddl id>` fills the form from another huddl of this group. Nothing
@@ -117,28 +113,25 @@ defmodule HuddlzWeb.HuddlLive.New do
   end
 
   defp assign_copy(socket, source) do
-    local_starts_at = DateTime.shift_zone!(source.starts_at, source.time_zone)
     date = CopySuggestion.date(source)
-    start_time = DateTime.to_time(local_starts_at)
-    duration = DateTime.diff(source.ends_at, source.starts_at, :minute)
+    start_time = CopyDefaults.local_start_time(source)
+    duration = CopyDefaults.duration_minutes(source)
 
     location =
       Enum.find(socket.assigns.group_locations, &(&1.id == source.group_location_id))
 
-    params = %{
-      "copied_from_id" => source.id,
-      "group_id" => source.group_id,
-      "title" => source.title,
-      "description" => source.description || "",
-      "event_type" => to_string(source.event_type),
-      "virtual_link" => source.virtual_link || "",
-      "max_attendees" => if(source.max_attendees, do: to_string(source.max_attendees), else: ""),
-      "is_private" => to_string(source.is_private),
-      "date" => Date.to_iso8601(date),
-      "start_time" => Calendar.strftime(start_time, "%H:%M"),
-      "duration_minutes" => to_string(duration),
-      "group_location_id" => location && location.id
-    }
+    params =
+      source
+      |> CopyDefaults.attributes()
+      |> Map.new(fn {field, value} -> {Atom.to_string(field), to_string(value)} end)
+      |> Map.merge(%{
+        "copied_from_id" => source.id,
+        "group_id" => source.group_id,
+        "group_location_id" => location && location.id,
+        "date" => Date.to_iso8601(date),
+        "start_time" => Calendar.strftime(start_time, "%H:%M"),
+        "duration_minutes" => to_string(duration)
+      })
 
     # Validating right away shows a removed location's error as the form opens.
     form = AshPhoenix.Form.validate(socket.assigns.form.source, params)
@@ -149,67 +142,15 @@ defmodule HuddlzWeb.HuddlLive.New do
     |> assign(:selected_location, location)
     |> assign(:form, to_form(form))
     |> update_event_type_visibility(params)
-    |> assign(:calculated_end_time, calculate_end_time(date, start_time, duration))
-  end
-
-  defp handle_upload_progress(:huddl_cover_image, entry, socket) do
-    if entry.done? do
-      {:noreply, ImageUploadPipeline.start_eager_upload(socket, upload_config(socket))}
-    else
-      {:noreply, socket}
-    end
   end
 
   @impl true
   def handle_async(:prepare_cover, result, socket) do
-    {:noreply, ImageUploadPipeline.finish_eager_upload(socket, result, upload_config(socket))}
-  end
-
-  defp cleanup_pending_image(socket),
-    do: ImageUploadPipeline.cleanup_pending_image(socket, upload_config(socket))
-
-  # The pending cover belongs to the group before it belongs to a huddl.
-  defp upload_config(socket) do
-    group_id = socket.assigns.group.id
-
-    %{
-      upload_name: :huddl_cover_image,
-      storage: HuddlCoverImages,
-      create_pending: &create_pending_huddl_cover_image(group_id, &1, &2, &3),
-      cleanup: &soft_delete_pending_huddl_cover_image/2
-    }
-  end
-
-  defp create_pending_huddl_cover_image(group_id, actor, entry, metadata) do
-    Communities.create_pending_huddl_cover_image(
-      group_id,
-      %{
-        filename: entry.client_name,
-        content_type: entry.client_type,
-        size_bytes: metadata.size_bytes,
-        storage_path: metadata.storage_path,
-        thumbnail_path: metadata.thumbnail_path
-      },
-      actor: actor
-    )
-  end
-
-  defp soft_delete_pending_huddl_cover_image(socket, image_id) do
-    with {:ok, image} <- Communities.get_huddl_cover_image_by_id(image_id),
-         true <- is_nil(image.huddl_id) do
-      Communities.soft_delete_huddl_cover_image(image, actor: socket.assigns.current_user)
-    end
+    {:noreply, CoverUpload.finish(socket, result)}
   end
 
   @impl true
   def render(assigns) do
-    time_zone = schedule_time_zone(assigns.form, assigns.selected_location, assigns.group)
-
-    assigns =
-      assigns
-      |> assign(:schedule_time_zone, time_zone)
-      |> assign(:ambiguous_time_label, ambiguous_time_label(assigns.form, time_zone))
-
     ~H"""
     <Layouts.app
       flash={@flash}
@@ -254,10 +195,8 @@ defmodule HuddlzWeb.HuddlLive.New do
 
         <.when_panel
           form={@form}
-          calculated_end_time={@calculated_end_time}
           duration_prompt="Select duration…"
-          schedule_time_zone={@schedule_time_zone}
-          ambiguous_time_label={@ambiguous_time_label}
+          selected_location={@selected_location}
           date_help={suggested_date_help(@copy_source, @form)}
         >
           <:recurring_controls>
@@ -349,29 +288,24 @@ defmodule HuddlzWeb.HuddlLive.New do
   end
 
   def handle_event("cancel_pending_image", _params, socket) do
-    {:noreply, cleanup_pending_image(socket)}
+    {:noreply, CoverUpload.discard(socket)}
   end
 
   @impl true
   def handle_event("validate", %{"form" => params}, socket) do
     params =
-      inject_saved_location_params(
-        params,
-        socket.assigns[:selected_location],
-        socket.assigns.form
-      )
+      params
+      |> Map.put("group_id", socket.assigns.group.id)
+      |> inject_saved_location_params(socket.assigns.selected_location, socket.assigns.form)
 
-    socket =
-      socket
-      |> update_event_type_visibility(params)
-      |> update_calculated_end_time(params)
+    socket = update_event_type_visibility(socket, params)
 
     form = AshPhoenix.Form.validate(socket.assigns.form, params)
 
     {:noreply,
      socket
      |> assign(:form, to_form(form))
-     |> ImageUploadPipeline.drop_invalid_entries(upload_config(socket))}
+     |> CoverUpload.drop_invalid_entries()}
   end
 
   @impl true
@@ -412,6 +346,12 @@ defmodule HuddlzWeb.HuddlLive.New do
          |> redirect(to: path)}
 
       {:error, form} ->
+        socket =
+          case AshPhoenix.Form.errors(form, format: :simple)[:pending_image_id] do
+            nil -> socket
+            message -> put_flash(socket, :error, message)
+          end
+
         {:noreply, socket |> assign(:form, to_form(form)) |> FormFocus.first_error("huddl-form")}
     end
   end

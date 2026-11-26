@@ -7,13 +7,14 @@ defmodule HuddlzWeb.HuddlLive.Edit do
   import HuddlzWeb.Components.HuddlForm
   import HuddlzWeb.Components.UploadComponents
   import HuddlzWeb.HuddlLive.FormHelpers
-  import HuddlzWeb.Live.Helpers.UploadHelpers
 
   alias Huddlz.Communities
+  alias Huddlz.Communities.Huddl
   alias Huddlz.Communities.HuddlTemplate
   alias Huddlz.Storage.GroupImages
   alias Huddlz.Storage.HuddlCoverImages
   alias HuddlzWeb.FormFocus
+  alias HuddlzWeb.HuddlLive.CoverUpload
   alias HuddlzWeb.Layouts
   alias HuddlzWeb.Live.Helpers.ImageUploadPipeline
 
@@ -48,10 +49,7 @@ defmodule HuddlzWeb.HuddlLive.Edit do
     current_params = socket.assigns.form.source.params || %{}
     updated_params = Map.put(current_params, "edit_type", type)
 
-    socket =
-      socket
-      |> update_event_type_visibility(updated_params)
-      |> update_calculated_end_time(updated_params)
+    socket = update_event_type_visibility(socket, updated_params)
 
     form = AshPhoenix.Form.validate(socket.assigns.form, updated_params)
     assign(socket, :form, to_form(form))
@@ -61,7 +59,7 @@ defmodule HuddlzWeb.HuddlLive.Edit do
     user = socket.assigns.current_user
 
     with {:ok, huddl} <- get_huddl(id, group_slug, user),
-         :ok <- authorize({huddl, :update}, user) do
+         true <- Huddl.editable_by?(huddl, user) do
       group_locations = load_group_locations(huddl.group.id, user)
 
       socket =
@@ -72,11 +70,8 @@ defmodule HuddlzWeb.HuddlLive.Edit do
           :selected_location,
           Enum.find(group_locations, &(&1.id == huddl.group_location_id))
         )
-        |> assign(:image_error, nil)
-        |> assign(:pending_image_id, nil)
-        |> assign(:pending_preview_url, nil)
-        |> assign(:upload_processing, false)
-        |> allow_image_upload(:huddl_cover_image, &handle_upload_progress/3)
+        |> CoverUpload.init()
+        |> CoverUpload.allow(huddl.group.id)
 
       {:noreply, socket}
     else
@@ -87,7 +82,7 @@ defmodule HuddlzWeb.HuddlLive.Edit do
            fallback_path: ~p"/groups/#{group_slug}"
          )}
 
-      {:error, :not_authorized} ->
+      false ->
         {:noreply,
          handle_error(socket, :not_authorized,
            resource_name: "huddl",
@@ -133,7 +128,6 @@ defmodule HuddlzWeb.HuddlLive.Edit do
     |> assign(:huddl, huddl)
     |> assign(:show_physical_location, huddl.event_type in [:in_person, :hybrid])
     |> assign(:show_virtual_link, huddl.event_type in [:virtual, :hybrid])
-    |> assign(:calculated_end_time, calculate_end_time(date, start_time, duration_minutes))
     |> assign(:form, to_form(form))
   end
 
@@ -148,65 +142,13 @@ defmodule HuddlzWeb.HuddlLive.Edit do
     end
   end
 
-  defp handle_upload_progress(:huddl_cover_image, entry, socket) do
-    if entry.done? do
-      {:noreply, ImageUploadPipeline.start_eager_upload(socket, upload_config(socket))}
-    else
-      {:noreply, socket}
-    end
-  end
-
   @impl true
   def handle_async(:prepare_cover, result, socket) do
-    {:noreply, ImageUploadPipeline.finish_eager_upload(socket, result, upload_config(socket))}
-  end
-
-  defp cleanup_pending_image(socket),
-    do: ImageUploadPipeline.cleanup_pending_image(socket, upload_config(socket))
-
-  # The pending cover belongs to the group before it belongs to a huddl.
-  defp upload_config(socket) do
-    group_id = socket.assigns.huddl.group.id
-
-    %{
-      upload_name: :huddl_cover_image,
-      storage: HuddlCoverImages,
-      create_pending: &create_pending_huddl_cover_image(group_id, &1, &2, &3),
-      cleanup: &soft_delete_pending_huddl_cover_image/2
-    }
-  end
-
-  defp create_pending_huddl_cover_image(group_id, actor, entry, metadata) do
-    Communities.create_pending_huddl_cover_image(
-      group_id,
-      %{
-        filename: entry.client_name,
-        content_type: entry.client_type,
-        size_bytes: metadata.size_bytes,
-        storage_path: metadata.storage_path,
-        thumbnail_path: metadata.thumbnail_path
-      },
-      actor: actor
-    )
-  end
-
-  defp soft_delete_pending_huddl_cover_image(socket, image_id) do
-    with {:ok, image} <- Communities.get_huddl_cover_image_by_id(image_id),
-         true <- is_nil(image.huddl_id) do
-      Communities.soft_delete_huddl_cover_image(image, actor: socket.assigns.current_user)
-    end
+    {:noreply, CoverUpload.finish(socket, result)}
   end
 
   @impl true
   def render(assigns) do
-    time_zone =
-      schedule_time_zone(assigns.form, assigns.selected_location, assigns.huddl.group)
-
-    assigns =
-      assigns
-      |> assign(:schedule_time_zone, time_zone)
-      |> assign(:ambiguous_time_label, ambiguous_time_label(assigns.form, time_zone))
-
     ~H"""
     <Layouts.app
       flash={@flash}
@@ -275,7 +217,8 @@ defmodule HuddlzWeb.HuddlLive.Edit do
           image_url={cover_url(@pending_preview_url, @huddl)}
           caption={cover_caption(@pending_preview_url, @huddl)}
           processing?={@upload_processing}
-          image_error={@image_error}
+          image_error={ImageUploadPipeline.edit_cover_error(@image_error, @form, @pending_image_id)}
+          saved_image_url={cover_url(nil, @huddl)}
         >
           <:actions>
             <.cover_slot_button :if={@pending_preview_url} phx-click="cancel_pending_image">
@@ -289,6 +232,9 @@ defmodule HuddlzWeb.HuddlLive.Edit do
             </.cover_slot_button>
           </:actions>
         </.cover_image_panel>
+        <.button :if={@image_error} variant={:muted} type="button" phx-click="cancel_pending_image">
+          Discard replacement
+        </.button>
 
         <.basics_panel form={@form} />
 
@@ -296,9 +242,7 @@ defmodule HuddlzWeb.HuddlLive.Edit do
 
         <.when_panel
           form={@form}
-          calculated_end_time={@calculated_end_time}
-          schedule_time_zone={@schedule_time_zone}
-          ambiguous_time_label={@ambiguous_time_label}
+          selected_location={@selected_location}
         >
           <:recurring_controls>
             <%= if @huddl.huddl_template_id && edit_type_value(@form) == "all" do %>
@@ -405,7 +349,7 @@ defmodule HuddlzWeb.HuddlLive.Edit do
 
   @impl true
   def handle_event("cancel_pending_image", _params, socket) do
-    {:noreply, cleanup_pending_image(socket)}
+    {:noreply, socket |> CoverUpload.discard() |> assign(:image_error, nil)}
   end
 
   @impl true
@@ -435,17 +379,14 @@ defmodule HuddlzWeb.HuddlLive.Edit do
         socket.assigns.form
       )
 
-    socket =
-      socket
-      |> update_event_type_visibility(params)
-      |> update_calculated_end_time(params)
+    socket = update_event_type_visibility(socket, params)
 
     form = AshPhoenix.Form.validate(socket.assigns.form, params)
 
     {:noreply,
      socket
      |> assign(:form, to_form(form))
-     |> ImageUploadPipeline.drop_invalid_entries(upload_config(socket))}
+     |> CoverUpload.drop_invalid_entries()}
   end
 
   @impl true
@@ -458,13 +399,8 @@ defmodule HuddlzWeb.HuddlLive.Edit do
         :save
       )
 
-    case AshPhoenix.Form.submit(socket.assigns.form,
-           params: params,
-           actor: socket.assigns.current_user
-         ) do
-      {:ok, huddl} ->
-        assign_pending_image_to_huddl(socket, huddl)
-
+    case ImageUploadPipeline.submit_edit(socket, params) do
+      {:ok, _huddl} ->
         {:noreply,
          socket
          |> put_flash(:info, "Huddl updated successfully!")
@@ -472,8 +408,28 @@ defmodule HuddlzWeb.HuddlLive.Edit do
            to: ~p"/groups/#{socket.assigns.huddl.group.slug}/huddlz/#{socket.assigns.huddl.id}"
          )}
 
+      {:upload_error, message} ->
+        {:noreply,
+         socket
+         |> ImageUploadPipeline.refresh_saved_cover(:huddl, [
+           :current_image_url,
+           group: :current_image_url
+         ])
+         |> put_flash(:error, message)}
+
       {:error, form} ->
-        {:noreply, socket |> assign(:form, to_form(form)) |> FormFocus.first_error("huddl-form")}
+        {cover_error, message} = ImageUploadPipeline.save_errors(form)
+
+        {:noreply,
+         socket
+         |> ImageUploadPipeline.refresh_saved_cover(:huddl, [
+           :current_image_url,
+           group: :current_image_url
+         ])
+         |> assign(:form, to_form(form))
+         |> assign(:image_error, cover_error)
+         |> put_flash(:error, message)
+         |> FormFocus.first_error("huddl-form")}
     end
   end
 
@@ -503,30 +459,6 @@ defmodule HuddlzWeb.HuddlLive.Edit do
   @impl true
   def handle_info({:saved_location_cleared, "saved-location-picker"}, socket) do
     {:noreply, clear_saved_location(socket)}
-  end
-
-  defp assign_pending_image_to_huddl(socket, huddl) do
-    case socket.assigns[:pending_image_id] do
-      nil ->
-        :ok
-
-      image_id ->
-        case Communities.get_current_huddl_cover_image(huddl.id) do
-          {:ok, existing} when not is_nil(existing) ->
-            Communities.soft_delete_huddl_cover_image(existing,
-              actor: socket.assigns.current_user
-            )
-
-          _ ->
-            :ok
-        end
-
-        with {:ok, image} <- Communities.get_huddl_cover_image_by_id(image_id) do
-          Communities.assign_huddl_cover_image_to_huddl(image, huddl.id,
-            actor: socket.assigns.current_user
-          )
-        end
-    end
   end
 
   defp get_huddl(id, group_slug, user) do

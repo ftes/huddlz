@@ -12,6 +12,7 @@ defmodule Huddlz.Communities.Group do
     domain: Huddlz.Communities,
     data_layer: AshPostgres.DataLayer,
     authorizers: [Ash.Policy.Authorizer],
+    notifiers: [Ash.Notifier.PubSub],
     extensions: [
       AshPaperTrail.Resource,
       AshJsonApi.Resource,
@@ -47,6 +48,20 @@ defmodule Huddlz.Communities.Group do
   json_api do
     type "group"
 
+    default_fields [
+      :id,
+      :name,
+      :slug,
+      :description,
+      :location,
+      :time_zone,
+      :is_public,
+      :latitude,
+      :longitude,
+      :archived_at,
+      :image_url
+    ]
+
     routes do
       base "/groups"
 
@@ -65,20 +80,6 @@ defmodule Huddlz.Communities.Group do
     end
   end
 
-  paper_trail do
-    change_tracking_mode :snapshot
-    store_action_name? true
-    reference_source? false
-    sensitive_attributes :ignore
-    ignore_attributes [:inserted_at, :updated_at]
-    belongs_to_actor :actor, Huddlz.Accounts.User, domain: Huddlz.Accounts, on_delete: :nilify
-    metadata :impersonation_id, :uuid
-    metadata :impersonator_id, :uuid
-    metadata :automatic?, :boolean
-    version_extensions authorizers: [Ash.Policy.Authorizer]
-    mixin {Huddlz.Audit.Version, :mixin, []}
-  end
-
   postgres do
     table "groups"
     repo Huddlz.Repo
@@ -91,6 +92,20 @@ defmodule Huddlz.Communities.Group do
         using: "GIST",
         where: "latitude IS NOT NULL AND longitude IS NOT NULL"
     end
+  end
+
+  paper_trail do
+    change_tracking_mode :snapshot
+    store_action_name? true
+    reference_source? false
+    sensitive_attributes :ignore
+    ignore_attributes [:inserted_at, :updated_at]
+    belongs_to_actor :actor, Huddlz.Accounts.User, domain: Huddlz.Accounts, on_delete: :nilify
+    metadata :impersonation_id, :uuid
+    metadata :impersonator_id, :uuid
+    metadata :automatic?, :boolean
+    version_extensions authorizers: [Ash.Policy.Authorizer]
+    mixin {Huddlz.Audit.Version, :mixin, []}
   end
 
   archive do
@@ -198,6 +213,9 @@ defmodule Huddlz.Communities.Group do
       argument :slug, :string, allow_nil?: true
       argument :provided_latitude, :float, allow_nil?: true, public?: false
       argument :provided_longitude, :float, allow_nil?: true, public?: false
+
+      argument :pending_image_id, :uuid, public?: false
+      change Huddlz.Communities.Changes.ReplaceCover
 
       change Huddlz.Communities.Group.Changes.SetOwnerToActor
       change Huddlz.Communities.Group.Changes.AddOwnerAsMember
@@ -313,19 +331,10 @@ defmodule Huddlz.Communities.Group do
 
     read :get_for_organize do
       description """
-      Get a group by slug, but only when the actor can manage it as an
-      organizer — they own the group or are an `:organizer` GroupMember.
-      Being an administrator does not count. Drives `OrganizeLive`'s
-      per-slug auth check; nil result means "not organizable by this actor."
+      Read a group the actor owns or helps organize, including archived
+      groups. Both opening a workspace by slug and refreshing it by id
+      use this action's organizer policies.
       """
-
-      get? true
-
-      argument :slug, :string do
-        allow_nil? false
-      end
-
-      filter expr(slug == ^arg(:slug))
     end
 
     update :update_details do
@@ -344,6 +353,9 @@ defmodule Huddlz.Communities.Group do
       ]
 
       require_atomic? false
+
+      argument :pending_image_id, :uuid, public?: false
+      change Huddlz.Communities.Changes.ReplaceCover
 
       argument :provided_latitude, :float, allow_nil?: true, public?: false
       argument :provided_longitude, :float, allow_nil?: true, public?: false
@@ -429,6 +441,18 @@ defmodule Huddlz.Communities.Group do
     end
   end
 
+  pub_sub do
+    module Phoenix.PubSub
+    name Huddlz.PubSub
+    prefix "group"
+    transform fn notification -> {:group_changed, notification.data.id} end
+
+    publish :archive, [:id]
+    publish :unarchive, [:id]
+    publish :update_details, [:id]
+    publish :destroy, [:id]
+  end
+
   validations do
     validate string_length(:name, min: @name_length.first, max: @name_length.last) do
       message "Must be between 3 and 100 characters"
@@ -443,6 +467,9 @@ defmodule Huddlz.Communities.Group do
       where action_is([:create_group, :update_details])
     end
   end
+
+  def active?(%{archived_at: nil}), do: true
+  def active?(_group), do: false
 
   @doc false
   def valid_name_length?(name) do
@@ -547,6 +574,18 @@ defmodule Huddlz.Communities.Group do
   end
 
   calculations do
+    calculate :owned_by_me, :boolean do
+      public? true
+      description "Whether the current caller owns this group"
+      calculation expr(not is_nil(^actor(:id)) and owner_id == ^actor(:id))
+    end
+
+    calculate :image_url, :string do
+      public? true
+      description "Absolute URL for the group's current image; null without one"
+      calculation Huddlz.Communities.Group.Calculations.ImageUrl
+    end
+
     calculate :search_relevance, :float do
       argument :query, :string, allow_nil?: false
 
